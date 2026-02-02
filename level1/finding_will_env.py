@@ -1,133 +1,137 @@
 # finding_will_env.py
-import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
-import math
-import random
-from enum import Enum
+import numpy as np
 
-MAX_MOVES = 25
+TOTAL_DEMOS = 6
+MAX_STEPS = 25
 
-USE_ELEVEN_THRESHOLD = 0.6
-USE_LIGHT_THRESHOLD = 0.4
-USE_DEMOGORGAN_THRESHOLD = 0.7
+PORTAL_THRESHOLD = 0.40
+STEP_SIZE = 1.0 / (TOTAL_DEMOS + 2)
 
-
-class World(Enum):
-    HOME = 0
-    LAB = 1
-    UPSIDE_DOWN = 2
-
-
-class Eleven:
-    def __init__(self):
-        self.psychic_field = 0.0
-        self.strain = 0.0
-        self.used = False
-
-    def update(self, force):
-        self.used = abs(force) > USE_ELEVEN_THRESHOLD
-        self.psychic_field += force * 0.08
-        self.psychic_field *= 0.97
-        self.strain += abs(force) * 0.05
-        self.strain *= 0.99
-
-
-class Lights:
-    def __init__(self):
-        self.phase = random.uniform(0, 2 * math.pi)
-        self.signal = 0.3
-        self.used = False
-
-    def update(self, belief, force):
-        self.used = abs(force) > USE_LIGHT_THRESHOLD
-        if self.used:
-            self.phase += 0.9
-        self.signal = 0.3 + 0.7 * belief
-
-
-class Demogorgon:
-    def __init__(self):
-        self.visible = False
-
-    def update(self, stress):
-        self.visible = stress > USE_DEMOGORGAN_THRESHOLD
-
-
-class FindingWillEnv(gym.Env):
+class FindWillEnv(gym.Env):
     def __init__(self):
         super().__init__()
 
-        self.action_space = spaces.Box(
-            low=np.array([-1.0, -1.0], dtype=np.float32),
-            high=np.array([1.0, 1.0], dtype=np.float32),
-            dtype=np.float32
-        )
+        self.action_space = spaces.Box(0.0, 1.0, shape=(2,), dtype=np.float32)
 
+        # obs:
+        # [progress, eleven_power, joyce_power, known_frac, threat, demo_index_norm]
         self.observation_space = spaces.Box(
             low=0.0,
-            high=1.5,
-            shape=(3,),
+            high=1.2,
+            shape=(6,),
             dtype=np.float32
         )
 
         self.reset()
 
     def reset(self, seed=None, options=None):
-        super().reset(seed=seed)
+        self.progress = 0.0
+        self.steps = 0
 
-        self.belief = 0.2
-        self.stress = 0.1
-        self.moves_left = MAX_MOVES
+        self.eleven_power = 1.0
+        self.joyce_power = 1.0
 
-        self.eleven = Eleven()
-        self.lights = Lights()
-        self.demogorgon = Demogorgon()
-        self.world = World.HOME
+        self.in_upside_down = False
 
-        return self._get_obs(), {}
+        # 🔥 STOCHASTIC DEMOGORGONS
+        self.demos = [
+            {
+                "known": False,
+                "cleared": False,
+                "strength": np.random.uniform(0.8, 1.2)  # hidden difficulty
+            }
+            for _ in range(TOTAL_DEMOS)
+        ]
 
-    def _get_obs(self):
-        return np.array([self.belief, self.stress, self.eleven.strain], dtype=np.float32)
+        self.current_index = 0
+        return self._obs(), {}
+
+    def _obs(self):
+        known_frac = sum(d["known"] for d in self.demos) / TOTAL_DEMOS
+        threat = (
+            1.0
+            if self.current_index < TOTAL_DEMOS
+            and not self.demos[self.current_index]["cleared"]
+            else 0.0
+        )
+
+        return np.array([
+            self.progress,
+            self.eleven_power,
+            self.joyce_power,
+            known_frac,
+            threat,
+            self.current_index / TOTAL_DEMOS
+        ], dtype=np.float32)
 
     def step(self, action):
-        force, risk = float(action[0]), float(action[1])
-        self.moves_left -= 1
-
-        self.eleven.update(force)
-        self.lights.update(self.belief, force)
-        self.demogorgon.update(self.stress)
-
-        self.belief += (
-            0.05 * self.eleven.psychic_field +
-            (0.07 if self.lights.used else 0.0) -
-            0.03 * self.stress
-        )
-        self.belief = np.clip(self.belief, 0, 1)
-
-        self.stress += abs(risk) * 0.05
-        self.stress *= 0.98
-
-        if self.stress > 0.75:
-            self.world = World.UPSIDE_DOWN
-        elif self.eleven.used:
-            self.world = World.LAB
-        else:
-            self.world = World.HOME
-
-        reward = self.belief - self.stress
+        self.steps += 1
+        search, fight = action
         done = False
+        reward = 0.0
         success = False
 
-        if self.belief >= 1.0:
-            reward += 100
-            done = True
-            success = True
+        # ---------------- SEARCH (IMPERFECT INFO) ----------------
+        if search > 0.6 and self.eleven_power > 0.1:
+            for d in self.demos:
+                if not d["known"]:
+                    if np.random.rand() < 0.75:  # 🔥 noisy scan
+                        d["known"] = True
+                    self.eleven_power -= 0.06
+                    self.joyce_power -= 0.01
+                    break
 
-        if self.moves_left <= 0:
-            done = True
+        # ---------------- FIGHT ----------------
+        if self.current_index < TOTAL_DEMOS:
+            demo = self.demos[self.current_index]
 
-        return self._get_obs(), reward, done, False, {
-            "moves_left": self.moves_left,
-            "success": success
+            if not demo["cleared"] and fight > 0.6:
+                difficulty = demo["strength"]
+
+                if demo["known"]:
+                    self.eleven_power -= 0.07 * difficulty
+                    self.joyce_power -= 0.05 * difficulty
+                else:
+                    self.eleven_power -= 0.12 * difficulty
+                    self.joyce_power -= 0.10 * difficulty
+
+                demo["cleared"] = True
+
+            elif not demo["cleared"]:
+                # 🔥 reward restraint stochastically
+                self.eleven_power += np.random.uniform(0.02, 0.06)
+
+        # ---------------- MOVE ----------------
+        if (
+            self.current_index >= TOTAL_DEMOS
+            or self.demos[self.current_index]["cleared"]
+        ):
+            self.progress += STEP_SIZE
+            self.current_index += 1
+
+        # ---------------- PORTAL ----------------
+        if self.progress >= 0.8 and not self.in_upside_down:
+            combined = self.eleven_power + self.joyce_power
+            if combined >= PORTAL_THRESHOLD:
+                self.in_upside_down = True
+                self.eleven_power -= 0.10
+                self.joyce_power -= 0.10
+            else:
+                self.progress -= STEP_SIZE * 0.5
+
+        # ---------------- TERMINATION ----------------
+        if self.progress >= 1.0 or self.steps >= MAX_STEPS:
+            done = True
+            reward = self.eleven_power + self.joyce_power
+            success = reward >= PORTAL_THRESHOLD
+
+        self.eleven_power = np.clip(self.eleven_power, 0.0, 1.2)
+        self.joyce_power = np.clip(self.joyce_power, 0.0, 1.2)
+
+        return self._obs(), reward, done, False, {
+            "success": success,
+            "final_power": reward,
+            "steps": self.steps
         }
